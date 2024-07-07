@@ -249,7 +249,7 @@ def refine_mask(ref):
     return ref_image, refined_ref_mask_pil
 
 
-def run_local(base, ref, *args):
+def run_local(base, ref, strength, ddim_steps, scale, seed, enable_shape_control):
     image = base["image"].convert("RGB")
     mask = base["mask"].convert("L")
     ref_image = ref["image"].convert("RGB")
@@ -267,14 +267,13 @@ def run_local(base, ref, *args):
     if mask.sum() == 0:
         raise gr.Error('No mask for the background image.')
 
-    synthesis = inference_single_image(ref_image.copy(), ref_mask.copy(), image.copy(), mask.copy(), *args)
+    synthesis = inference_single_image(ref_image.copy(), ref_mask.copy(), image.copy(), mask.copy(), 
+                                       strength, ddim_steps, scale, seed, enable_shape_control)
     synthesis = torch.from_numpy(synthesis).permute(2, 0, 1)
     synthesis = synthesis.permute(1, 2, 0).numpy()
     return [synthesis]
 
-
-
-with gr.Blocks() as demo:
+with gr.Blocks(css="#canvas-bg { position: relative; } #draggable-mask { position: absolute; top: 0; left: 0; pointer-events: none; }") as demo:
     with gr.Column():
         gr.Markdown("# Play with AnyDoor to Teleport your Target Objects!")
         with gr.Row():
@@ -287,6 +286,7 @@ with gr.Blocks() as demo:
                 seed = gr.Slider(label="Seed", minimum=-1, maximum=999999999, step=1, value=-1)
                 reference_mask_refine = gr.Checkbox(label='Reference Mask Refine', value=False, interactive=True)
                 enable_shape_control = gr.Checkbox(label='Enable Shape Control', value=False, interactive=True)
+                enable_drag_scale = gr.Checkbox(label='Enable Drag and Scale', value=False, interactive=True)
 
                 gr.Markdown("### Guidelines")
                 gr.Markdown(" Higher guidance-scale makes higher fidelity, while lower one makes more harmonized blending.")
@@ -294,13 +294,16 @@ with gr.Blocks() as demo:
                               Reference Mask Refine provides a segmentation model to refine the coarse mask. ")
                 gr.Markdown(" Enable shape control means the generation results would consider user-drawn masks to control the shape & pose; otherwise it \
                               considers the location and size to adjust automatically.")
+                gr.Markdown(" Enable Drag and Scale allows you to position and resize the reference mask on the background image.")
 
         gr.Markdown("# Upload / Select Images for the Background (left) and Reference Object (right)")
         gr.Markdown("### You could draw coarse masks on the background to indicate the desired location and shape.")
         gr.Markdown("### <u>Do not forget</u> to annotate the target object on the reference image.")
         with gr.Row():
-            base = gr.Image(label="Background", source="upload", tool="sketch", type="pil", height=512, brush_color='#FFFFFF', mask_opacity=0.5)
-            ref = gr.Image(label="Reference", source="upload", tool="sketch", type="pil", height=512, brush_color='#FFFFFF', mask_opacity=0.5)
+            base = gr.Image(label="Background", source="upload", tool="sketch", type="pil", height=512, brush_color='#FFFFFF', mask_opacity=0.5, elem_id="base-image")
+            ref = gr.Image(label="Reference", source="upload", tool="sketch", type="pil", height=512, brush_color='#FFFFFF', mask_opacity=0.5, elem_id="ref-image")
+            duplicate_mask_button = gr.Button(label="Duplicate Ref Mask to Background")
+            combine_masks_button = gr.Button(label="Combine Masks")
 
         run_local_button = gr.Button(label="Generate", value="Run")
         refine_mask_button = gr.Button(label="Refine Mask")
@@ -314,6 +317,7 @@ with gr.Blocks() as demo:
     run_local_button.click(fn=run_local, 
                            inputs=[base, 
                                    ref, 
+                                   enable_drag_scale,
                                    strength, 
                                    ddim_steps, 
                                    scale, 
@@ -326,3 +330,116 @@ with gr.Blocks() as demo:
                              inputs=[ref], 
                              outputs=[ref])
 
+    duplicate_mask_button.click(fn=None, inputs=[], outputs=[], _js="duplicateMask")
+    enable_drag_scale.change(fn=None, inputs=[enable_drag_scale], outputs=[], _js="enableDragScale")
+    combine_masks_button.click(fn=None, inputs=[], outputs=[], _js="combineMasks")
+
+demo.launch(js="""
+            
+    var isDragging = false;
+    var startX, startY;
+    var scale = 1;
+
+    function enableDragScale(enable) {
+        var mask = document.getElementById('draggable-mask');
+        if (mask) {
+            mask.style.pointerEvents = enable ? 'auto' : 'none';
+        }
+    }
+
+    function duplicateMask() {
+        var refMask = document.querySelector('#ref-image .sketch-canvas');
+        var bgImage = document.querySelector('#base-image');
+        var existingMask = document.getElementById('draggable-mask');
+        
+        if (existingMask) {
+            bgImage.removeChild(existingMask);
+        }
+        
+        var draggableMask = document.createElement('canvas');
+        draggableMask.id = 'draggable-mask';
+        draggableMask.width = refMask.width;
+        draggableMask.height = refMask.height;
+        var ctx = draggableMask.getContext('2d');
+        ctx.drawImage(refMask, 0, 0);
+        bgImage.appendChild(draggableMask);
+
+        draggableMask.addEventListener('mousedown', startDragging);
+        draggableMask.addEventListener('wheel', handleScaling);
+    }
+
+    function startDragging(e) {
+        isDragging = true;
+        startX = e.clientX - this.offsetLeft;
+        startY = e.clientY - this.offsetTop;
+    }
+
+    function handleScaling(e) {
+        e.preventDefault();
+        scale += e.deltaY * -0.01;
+        scale = Math.min(Math.max(0.1, scale), 3);
+        this.style.transform = `scale(${scale})`;
+    }
+
+    document.addEventListener('mousemove', function(e) {
+        var mask = document.getElementById('draggable-mask');
+        if (isDragging && mask) {
+            mask.style.left = (e.clientX - startX) + 'px';
+            mask.style.top = (e.clientY - startY) + 'px';
+        }
+    });
+
+    document.addEventListener('mouseup', function() {
+        isDragging = false;
+    });
+
+    // Function to get the dragged and scaled mask data
+    function getDraggedScaledMask() {
+        var mask = document.getElementById('draggable-mask');
+        if (mask) {
+            var canvas = document.createElement('canvas');
+            canvas.width = mask.width;
+            canvas.height = mask.height;
+            var ctx = canvas.getContext('2d');
+            ctx.drawImage(mask, 0, 0);
+            return canvas.toDataURL();
+        }
+        return null;
+    }
+    
+    function combineMasks() {
+        var bgCanvas = document.querySelector('#base-image .sketch-canvas');
+        var draggableMask = document.getElementById('draggable-mask');
+        if (bgCanvas && draggableMask) {
+            var bgCtx = bgCanvas.getContext('2d');
+            var tempCanvas = document.createElement('canvas');
+            tempCanvas.width = bgCanvas.width;
+            tempCanvas.height = bgCanvas.height;
+            var tempCtx = tempCanvas.getContext('2d');
+        
+            // Draw the original background mask
+            tempCtx.drawImage(bgCanvas, 0, 0);
+
+            // Draw the dragged and scaled mask
+            tempCtx.globalCompositeOperation = 'source-over';
+            var matrix = new DOMMatrix(draggableMask.style.transform);
+            tempCtx.setTransform(matrix);
+            tempCtx.translate(parseInt(draggableMask.style.left) || 0, parseInt(draggableMask.style.top) || 0);
+            tempCtx.drawImage(draggableMask, 0, 0);
+        
+            // Reset transformation
+            tempCtx.setTransform(1, 0, 0, 1, 0, 0);
+
+            // Draw the combined mask back to the background canvas
+            bgCtx.globalCompositeOperation = 'source-over';
+            bgCtx.drawImage(tempCanvas, 0, 0);
+
+            // Remove the draggable mask
+            draggableMask.remove();
+        
+            // Trigger Gradio's change event for the background image
+            bgCanvas.dispatchEvent(new Event('change', { 'bubbles': true }));
+        }
+    }
+            
+""")
