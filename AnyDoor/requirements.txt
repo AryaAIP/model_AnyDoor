@@ -22,3 +22,11 @@ tqdm==4.65.0
 transformers==4.19.2
 xformers==0.0.18
 wget==3.2
+fastapi
+pydantic
+streamlit
+streamlit_drawable_canvas
+base64
+uvicorn
+threading
+webbrowser

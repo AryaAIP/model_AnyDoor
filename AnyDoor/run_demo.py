@@ -3,9 +3,18 @@ import einops
 import numpy as np
 import torch
 import random
-import gradio as gr
 import os
 import albumentations as A
+
+from fastapi import FastAPI, UploadFile, File
+from fastapi.responses import FileResponse
+from pydantic import BaseModel
+from PIL import Image
+import io
+import streamlit as st
+from streamlit_drawable_canvas import st_canvas
+import base64
+
 from PIL import Image
 import torchvision.transforms as T
 from datasets.data_utils import * 
@@ -273,173 +282,202 @@ def run_local(base, ref, strength, ddim_steps, scale, seed, enable_shape_control
     synthesis = synthesis.permute(1, 2, 0).numpy()
     return [synthesis]
 
-with gr.Blocks(css="#canvas-bg { position: relative; } #draggable-mask { position: absolute; top: 0; left: 0; pointer-events: none; }") as demo:
-    with gr.Column():
-        gr.Markdown("# Play with AnyDoor to Teleport your Target Objects!")
-        with gr.Row():
-            baseline_gallery = gr.Gallery(label='Output', show_label=True, elem_id="gallery", columns=1, height=768)
-            with gr.Accordion("Advanced Option", open=True):
-                num_samples = 1
-                strength = gr.Slider(label="Control Strength", minimum=0.0, maximum=2.0, value=1.0, step=0.01)
-                ddim_steps = gr.Slider(label="Steps", minimum=1, maximum=100, value=30, step=1)
-                scale = gr.Slider(label="Guidance Scale", minimum=0.1, maximum=30.0, value=4.5, step=0.1)
-                seed = gr.Slider(label="Seed", minimum=-1, maximum=999999999, step=1, value=-1)
-                reference_mask_refine = gr.Checkbox(label='Reference Mask Refine', value=False, interactive=True)
-                enable_shape_control = gr.Checkbox(label='Enable Shape Control', value=False, interactive=True)
-                enable_drag_scale = gr.Checkbox(label='Enable Drag and Scale', value=False, interactive=True)
-
-                gr.Markdown("### Guidelines")
-                gr.Markdown(" Higher guidance-scale makes higher fidelity, while lower one makes more harmonized blending.")
-                gr.Markdown(" Users should annotate the mask of the target object, too coarse mask would lead to bad generation.\
-                              Reference Mask Refine provides a segmentation model to refine the coarse mask. ")
-                gr.Markdown(" Enable shape control means the generation results would consider user-drawn masks to control the shape & pose; otherwise it \
-                              considers the location and size to adjust automatically.")
-                gr.Markdown(" Enable Drag and Scale allows you to position and resize the reference mask on the background image.")
-
-        gr.Markdown("# Upload / Select Images for the Background (left) and Reference Object (right)")
-        gr.Markdown("### You could draw coarse masks on the background to indicate the desired location and shape.")
-        gr.Markdown("### <u>Do not forget</u> to annotate the target object on the reference image.")
-        with gr.Row():
-            base = gr.Image(label="Background", source="upload", tool="sketch", type="pil", height=512, brush_color='#FFFFFF', mask_opacity=0.5, elem_id="base-image")
-            ref = gr.Image(label="Reference", source="upload", tool="sketch", type="pil", height=512, brush_color='#FFFFFF', mask_opacity=0.5, elem_id="ref-image")
-            duplicate_mask_button = gr.Button(label="Duplicate Ref Mask to Background")
-            combine_masks_button = gr.Button(label="Combine Masks")
-
-        run_local_button = gr.Button(label="Generate", value="Run")
-        refine_mask_button = gr.Button(label="Refine Mask")
-
-        with gr.Row():
-            with gr.Column():
-                gr.Examples(image_list, inputs=[base], label="Examples - Background Image", examples_per_page=16)
-            with gr.Column():
-                gr.Examples(ref_list, inputs=[ref], label="Examples - Reference Object", examples_per_page=16)
-
-    run_local_button.click(fn=run_local, 
-                           inputs=[base, 
-                                   ref, 
-                                   enable_drag_scale,
-                                   strength, 
-                                   ddim_steps, 
-                                   scale, 
-                                   seed,
-                                   enable_shape_control, 
-                                   ], 
-                           outputs=[baseline_gallery])
-
-    refine_mask_button.click(fn=refine_mask, 
-                             inputs=[ref], 
-                             outputs=[ref])
-
-    duplicate_mask_button.click(fn=None, inputs=[], outputs=[], _js="duplicateMask")
-    enable_drag_scale.change(fn=None, inputs=[enable_drag_scale], outputs=[], _js="enableDragScale")
-    combine_masks_button.click(fn=None, inputs=[], outputs=[], _js="combineMasks")
-
-demo.launch(js="""
-            
-    var isDragging = false;
-    var startX, startY;
-    var scale = 1;
-
-    function enableDragScale(enable) {
-        var mask = document.getElementById('draggable-mask');
-        if (mask) {
-            mask.style.pointerEvents = enable ? 'auto' : 'none';
-        }
-    }
-
-    function duplicateMask() {
-        var refMask = document.querySelector('#ref-image .sketch-canvas');
-        var bgImage = document.querySelector('#base-image');
-        var existingMask = document.getElementById('draggable-mask');
-        
-        if (existingMask) {
-            bgImage.removeChild(existingMask);
-        }
-        
-        var draggableMask = document.createElement('canvas');
-        draggableMask.id = 'draggable-mask';
-        draggableMask.width = refMask.width;
-        draggableMask.height = refMask.height;
-        var ctx = draggableMask.getContext('2d');
-        ctx.drawImage(refMask, 0, 0);
-        bgImage.appendChild(draggableMask);
-
-        draggableMask.addEventListener('mousedown', startDragging);
-        draggableMask.addEventListener('wheel', handleScaling);
-    }
-
-    function startDragging(e) {
-        isDragging = true;
-        startX = e.clientX - this.offsetLeft;
-        startY = e.clientY - this.offsetTop;
-    }
-
-    function handleScaling(e) {
-        e.preventDefault();
-        scale += e.deltaY * -0.01;
-        scale = Math.min(Math.max(0.1, scale), 3);
-        this.style.transform = `scale(${scale})`;
-    }
-
-    document.addEventListener('mousemove', function(e) {
-        var mask = document.getElementById('draggable-mask');
-        if (isDragging && mask) {
-            mask.style.left = (e.clientX - startX) + 'px';
-            mask.style.top = (e.clientY - startY) + 'px';
-        }
-    });
-
-    document.addEventListener('mouseup', function() {
-        isDragging = false;
-    });
-
-    // Function to get the dragged and scaled mask data
-    function getDraggedScaledMask() {
-        var mask = document.getElementById('draggable-mask');
-        if (mask) {
-            var canvas = document.createElement('canvas');
-            canvas.width = mask.width;
-            canvas.height = mask.height;
-            var ctx = canvas.getContext('2d');
-            ctx.drawImage(mask, 0, 0);
-            return canvas.toDataURL();
-        }
-        return null;
-    }
+def duplicate_ref_mask_to_background(ref_mask, base_mask):
+    ref_mask_array = process_mask(ref_mask.image_data)
+    base_mask_array = process_mask(base_mask.image_data)
     
-    function combineMasks() {
-        var bgCanvas = document.querySelector('#base-image .sketch-canvas');
-        var draggableMask = document.getElementById('draggable-mask');
-        if (bgCanvas && draggableMask) {
-            var bgCtx = bgCanvas.getContext('2d');
-            var tempCanvas = document.createElement('canvas');
-            tempCanvas.width = bgCanvas.width;
-            tempCanvas.height = bgCanvas.height;
-            var tempCtx = tempCanvas.getContext('2d');
-        
-            // Draw the original background mask
-            tempCtx.drawImage(bgCanvas, 0, 0);
+    # Combine masks
+    combined_mask = np.maximum(base_mask_array, ref_mask_array)
+    
+    # Convert back to PIL Image
+    return Image.fromarray(combined_mask).convert("RGBA")
 
-            // Draw the dragged and scaled mask
-            tempCtx.globalCompositeOperation = 'source-over';
-            var matrix = new DOMMatrix(draggableMask.style.transform);
-            tempCtx.setTransform(matrix);
-            tempCtx.translate(parseInt(draggableMask.style.left) || 0, parseInt(draggableMask.style.top) || 0);
-            tempCtx.drawImage(draggableMask, 0, 0);
-        
-            // Reset transformation
-            tempCtx.setTransform(1, 0, 0, 1, 0, 0);
+app = FastAPI()
 
-            // Draw the combined mask back to the background canvas
-            bgCtx.globalCompositeOperation = 'source-over';
-            bgCtx.drawImage(tempCanvas, 0, 0);
+# FastAPI endpoints
+@app.post("/run_local")
+async def api_run_local(base_image: UploadFile, base_mask: UploadFile, ref_image: UploadFile, ref_mask: UploadFile, strength: float, ddim_steps: int, scale: float, seed: int, enable_shape_control: bool):
+    base_image = Image.open(io.BytesIO(await base_image.read())).convert("RGB")
+    base_mask = Image.open(io.BytesIO(await base_mask.read())).convert("L")
+    ref_image = Image.open(io.BytesIO(await ref_image.read())).convert("RGB")
+    ref_mask = Image.open(io.BytesIO(await ref_mask.read())).convert("L")
 
-            // Remove the draggable mask
-            draggableMask.remove();
-        
-            // Trigger Gradio's change event for the background image
-            bgCanvas.dispatchEvent(new Event('change', { 'bubbles': true }));
-        }
-    }
+    result = run_local({"image": base_image, "mask": base_mask},
+                       {"image": ref_image, "mask": ref_mask},
+                       strength, ddim_steps, scale, seed, enable_shape_control)
+
+    buffered = io.BytesIO()
+    Image.fromarray(result[0]).save(buffered, format="PNG")
+    img_str = base64.b64encode(buffered.getvalue()).decode()
+
+    return {"image": img_str}
+
+@app.post("/refine_mask")
+async def api_refine_mask(ref_image: UploadFile, ref_mask: UploadFile):
+    ref_image = Image.open(io.BytesIO(await ref_image.read())).convert("RGB")
+    ref_mask = Image.open(io.BytesIO(await ref_mask.read())).convert("L")
+
+    refined_image, refined_mask = refine_mask({"image": ref_image, "mask": ref_mask})
+
+    buffered_mask = io.BytesIO()
+    refined_mask.save(buffered_mask, format="PNG")
+    mask_str = base64.b64encode(buffered_mask.getvalue()).decode()
+
+    return {"mask": mask_str}
+
+# Streamlit UI
+def main():
+    st.title("AnyDoor: Teleport your Target Objects!")
+
+    # Output gallery
+    output_image = st.empty()
+
+    # Advanced options
+    with st.expander("Advanced Options"):
+        strength = st.slider("Control Strength", 0.0, 2.0, 1.0, 0.01)
+        ddim_steps = st.slider("Steps", 1, 100, 30, 1)
+        scale = st.slider("Guidance Scale", 0.1, 30.0, 4.5, 0.1)
+        seed = st.slider("Seed", -1, 999999999, -1, 1)
+        enable_shape_control = st.checkbox("Enable Shape Control", False)
+
+    # Image upload and mask drawing
+    col1, col2 = st.columns(2)
+    
+    # Background image and mask
+    with col1:
+        st.subheader("Background")
+        base_image = st.file_uploader("Upload background image", type=["png", "jpg", "jpeg"])
+        if base_image:
+            base_image_pil = Image.open(base_image).convert("RGB")
+            st.image(base_image_pil, use_column_width=True)
             
-""")
+            drawing_mode = st.selectbox("Drawing tool:", ("freedraw", "line", "rect", "circle", "transform"), key="base_drawing_mode")
+            stroke_width = st.slider("Stroke width:", 1, 25, 3, key="base_stroke_width")
+            stroke_color = st.color_picker("Stroke color:", "#FF0000", key="base_stroke_color")
+            
+            base_mask = st_canvas(
+                fill_color="rgba(255, 255, 255, 0.0)",
+                stroke_width=stroke_width,
+                stroke_color=f"{stroke_color}50",  # 50 is the alpha value for translucency
+                background_image=base_image_pil,
+                height=base_image_pil.height,
+                width=base_image_pil.width,
+                drawing_mode=drawing_mode,
+                key="base_canvas",
+            )
+
+    # Reference image and mask
+    with col2:
+        st.subheader("Reference")
+        ref_image = st.file_uploader("Upload reference image", type=["png", "jpg", "jpeg"])
+        if ref_image:
+            ref_image_pil = Image.open(ref_image).convert("RGB")
+            st.image(ref_image_pil, use_column_width=True)
+            
+            drawing_mode = st.selectbox("Drawing tool:", ("freedraw", "line", "rect", "circle", "transform"), key="ref_drawing_mode")
+            stroke_width = st.slider("Stroke width:", 1, 25, 3, key="ref_stroke_width")
+            stroke_color = st.color_picker("Stroke color:", "#FF0000", key="ref_stroke_color")
+            
+            ref_mask = st_canvas(
+                fill_color="rgba(255, 255, 255, 0.0)",
+                stroke_width=stroke_width,
+                stroke_color=f"{stroke_color}50",  # 50 is the alpha value for translucency
+                background_image=ref_image_pil,
+                height=ref_image_pil.height,
+                width=ref_image_pil.width,
+                drawing_mode=drawing_mode,
+                key="ref_canvas",
+            )
+
+    # Buttons
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        if st.button("Generate"):
+            if base_image and base_mask and ref_image and ref_mask:
+                base_mask_array = process_mask(base_mask.image_data)
+                ref_mask_array = process_mask(ref_mask.image_data)
+                
+                response = requests.post(
+                    "http://localhost:8000/run_local",
+                    files={
+                        "base_image": ("base_image.png", base_image.getvalue()),
+                        "base_mask": ("base_mask.png", Image.fromarray(base_mask_array).tobytes()),
+                        "ref_image": ("ref_image.png", ref_image.getvalue()),
+                        "ref_mask": ("ref_mask.png", Image.fromarray(ref_mask_array).tobytes())
+                    },
+                    data={
+                        "strength": strength,
+                        "ddim_steps": ddim_steps,
+                        "scale": scale,
+                        "seed": seed,
+                        "enable_shape_control": enable_shape_control
+                    }
+                )
+                result = response.json()
+                output_image.image(base64.b64decode(result["image"]))
+            else:
+                st.warning("Please upload all required images and draw masks.")
+
+    with col2:
+        if st.button("Refine Mask"):
+            if ref_image and ref_mask:
+                ref_mask_array = process_mask(ref_mask.image_data)
+                response = requests.post(
+                    "http://localhost:8000/refine_mask",
+                    files={
+                        "ref_image": ("ref_image.png", ref_image.getvalue()),
+                        "ref_mask": ("ref_mask.png", Image.fromarray(ref_mask_array).tobytes())
+                    }
+                )
+                result = response.json()
+                st.image(base64.b64decode(result["mask"]), caption="Refined Mask")
+            else:
+                st.warning("Please upload reference image and draw a mask.")
+
+    with col3:
+        if st.button("Duplicate Ref Mask to Background"):
+            if ref_mask is not None and base_mask is not None:
+                new_base_mask = duplicate_ref_mask_to_background(ref_mask, base_mask)
+            
+                # Update the base_canvas with the new mask
+                base_mask = st_canvas(
+                    fill_color="rgba(255, 255, 255, 0.0)",
+                    stroke_width=stroke_width,
+                    stroke_color=f"{stroke_color}50",
+                    background_image=base_image_pil,
+                    initial_drawing=new_base_mask,
+                    height=base_image_pil.height,
+                    width=base_image_pil.width,
+                    drawing_mode=drawing_mode,
+                    key="base_canvas_updated",
+                )
+            else:
+                st.warning("Please draw both reference and background masks.")
+
+def process_mask(mask_data):
+    mask_data = Image.fromarray(mask_data).convert("L")
+    return np.array(mask_data)
+
+def combine_masks(base_mask, ref_mask):
+    return np.maximum(base_mask, ref_mask)
+
+if __name__ == "__main__":
+    import uvicorn
+    import threading
+    import webbrowser
+
+    def run_fastapi():
+        uvicorn.run(app, host="0.0.0.0", port=8000)
+
+    def run_streamlit():
+        os.system("streamlit run main.py")
+
+    # Start FastAPI in a separate thread
+    fastapi_thread = threading.Thread(target=run_fastapi)
+    fastapi_thread.start()
+
+    # Open the Streamlit app in the default web browser
+    webbrowser.open("http://localhost:8501")
+
+    # Run Streamlit
+    run_streamlit()
