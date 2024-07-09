@@ -249,9 +249,6 @@ def refine_mask(ref):
     ref_mask = np.asarray(ref_mask)
     ref_mask = np.where(ref_mask > 128, 1, 0).astype(np.uint8)
 
-    if ref_mask.sum() == 0:
-        raise gr.Error('No mask for the reference image.')
-
     refined_ref_mask = process_image_mask(ref_image, ref_mask)
     refined_ref_mask_pil = Image.fromarray(refined_ref_mask * 255).convert("L")
 
@@ -269,12 +266,6 @@ def run_local(base, ref, strength, ddim_steps, scale, seed, enable_shape_control
     ref_image = np.asarray(ref_image)
     ref_mask = np.asarray(ref_mask)
     ref_mask = np.where(ref_mask > 128, 1, 0).astype(np.uint8)
-
-    if ref_mask.sum() == 0:
-        raise gr.Error('No mask for the reference image.')
-
-    if mask.sum() == 0:
-        raise gr.Error('No mask for the background image.')
 
     synthesis = inference_single_image(ref_image.copy(), ref_mask.copy(), image.copy(), mask.copy(), 
                                        strength, ddim_steps, scale, seed, enable_shape_control)
@@ -455,29 +446,45 @@ def main():
                 st.warning("Please draw both reference and background masks.")
 
 def process_mask(mask_data):
-    mask_data = Image.fromarray(mask_data).convert("L")
-    return np.array(mask_data)
+    if isinstance(mask_data, np.ndarray):
+        # If it's already a numpy array, convert to PIL Image
+        mask_image = Image.fromarray(mask_data)
+    elif isinstance(mask_data, Image.Image):
+        # If it's already a PIL Image, use it directly
+        mask_image = mask_data
+    else:
+        # If it's neither, try to create a PIL Image from it
+        try:
+            mask_image = Image.fromarray(np.array(mask_data))
+        except:
+            raise ValueError("Invalid mask data type. Expected numpy array or PIL Image.")
+    
+    
+    mask_array = np.array(mask_image.convert("L"))
+    
+    binary_mask = (mask_array > 128).astype(np.uint8) * 255
+    
+    return binary_mask
 
 def combine_masks(base_mask, ref_mask):
     return np.maximum(base_mask, ref_mask)
 
+import uvicorn
+import threading
+import subprocess
+import sys
+import os
+
+def run_fastapi():
+    uvicorn.run(app, host="0.0.0.0", port=8504)
+
+def run_streamlit():
+    subprocess.run([sys.executable, "-m", "streamlit", "run", __file__, "--server.port", "8505"])
+
 if __name__ == "__main__":
-    import uvicorn
-    import threading
-    import webbrowser
-
-    def run_fastapi():
-        uvicorn.run(app, host="0.0.0.0", port=8000)
-
-    def run_streamlit():
-        os.system("streamlit run main.py")
-
     # Start FastAPI in a separate thread
-    fastapi_thread = threading.Thread(target=run_fastapi)
+    fastapi_thread = threading.Thread(target=run_fastapi, daemon=True)
     fastapi_thread.start()
 
-    # Open the Streamlit app in the default web browser
-    webbrowser.open("http://localhost:8501")
-
-    # Run Streamlit
+    # Run Streamlit in the main thread
     run_streamlit()
