@@ -259,9 +259,17 @@ def main():
         ref_mask = np.where(ref_mask > 128, 1, 0).astype(np.uint8)
 
         refined_ref_mask = process_image_mask(ref_image, ref_mask)
-        refined_ref_mask_pil = Image.fromarray(refined_ref_mask * 255).convert("L")
+        
+        refined_ref_mask_rgba = np.zeros((refined_ref_mask.shape[0], refined_ref_mask.shape[1], 4), dtype=np.uint8)
+        
+        refined_ref_mask_rgba[..., 3] = refined_ref_mask * 204  # Alpha channel at 80% opacity
+        
+        # Set the RGB channels to white (255) where the mask is present
+        refined_ref_mask_rgba[..., 0:3] = np.where(refined_ref_mask[..., None], 181, 0)
+        
+        refined_ref_mask_pil = Image.fromarray(refined_ref_mask_rgba, mode="RGBA")
 
-        return ref_image, refined_ref_mask_pil
+        return np.asarray(refined_ref_mask_pil)
 
     @st.cache_resource
     def run_local(base, ref, strength, ddim_steps, scale, seed, enable_shape_control):
@@ -333,6 +341,10 @@ def main():
     st.write(f"Screen width is {streamlit_js_eval(js_expressions='screen.width', key = 'SCR')}")
     st.write(f"Screen height is {streamlit_js_eval(js_expressions='screen.height', key = 'SCR1')}")
     swidth = streamlit_js_eval(js_expressions='screen.width', key = 'SCR2')
+    
+    if 'refined_mask' not in st.session_state:
+        st.session_state.refined_mask = None
+    
     # Output gallery
     output_image = st.empty()
 
@@ -353,6 +365,7 @@ def main():
         scale = st.slider("Guidance Scale", 0.1, 30.0, 4.5, 0.1)
         seed = st.slider("Seed", -1, 999999999, -1, 1)
         enable_shape_control = st.checkbox("Enable Shape Control", False)
+        clone_mask = st.checkbox("Clone Reference Mask to Background", False)
 
     # Image upload and mask drawing
     col1, col2 = st.columns(2)
@@ -369,16 +382,70 @@ def main():
             stroke_width = st.slider("Stroke width:", 1, 150, 3, key="ref_stroke_width")
             stroke_color = st.color_picker("Stroke color:", "#B5B5B5", key="ref_stroke_color")
             
+            # Use the refined mask from session state if available
+            initial_drawing = None
+            if st.session_state.refined_mask is not None:
+                initial_drawing = {
+                    "version": "4.4.0",
+                    "objects": [
+                        {
+                            "type": "image",
+                            "version": "4.4.0",
+                            "originX": "left",
+                            "originY": "top",
+                            "left": 0,
+                            "top": 0,
+                            "width": ref_image_pil.width,
+                            "height": ref_image_pil.height,
+                            "fill": "rgb(0,0,0)",
+                            "stroke": None,
+                            "strokeWidth": 0,
+                            "strokeDashArray": None,
+                            "strokeLineCap": "butt",
+                            "strokeDashOffset": 0,
+                            "strokeLineJoin": "miter",
+                            "strokeUniform": False,
+                            "strokeMiterLimit": 4,
+                            "scaleX": 1,
+                            "scaleY": 1,
+                            "angle": 0,
+                            "flipX": False,
+                            "flipY": False,
+                            "opacity": 1,
+                            "shadow": None,
+                            "visible": True,
+                            "backgroundColor": "",
+                            "fillRule": "nonzero",
+                            "paintFirst": "fill",
+                            "globalCompositeOperation": "source-over",
+                            "skewX": 0,
+                            "skewY": 0,
+                            "cropX": 0,
+                            "cropY": 0,
+                            "src": f"data:image/png;base64,{base64.b64encode(cv2.imencode('.png', st.session_state.refined_mask.copy())[1]).decode()}",
+                            "crossOrigin": None,
+                            "filters": []
+                        }
+                    ]
+                }
+            
             ref_mask = st_canvas(
                 fill_color="rgba(181, 181, 181, 0.8)",
                 stroke_width=stroke_width,
-                stroke_color=f"{stroke_color}80",  # 50 is the alpha value for translucency
+                stroke_color=f"{stroke_color}80",
                 background_image=ref_image_pil,
                 height=ref_image_pil.height,
                 width=ref_image_pil.width,
+                initial_drawing=initial_drawing,
                 drawing_mode=drawing_mode,
                 key="ref_canvas",
             )
+
+            if st.button("Refine Mask"):
+                if ref_mask.image_data is not None and ref_image_pil is not None:
+                    refined_mask = refine_mask({"image": ref_image_pil, "mask": Image.fromarray(ref_mask.image_data)})
+                    st.session_state.refined_mask = refined_mask
+                    st.rerun()
 
     # Background image and mask
     with col1:
@@ -392,15 +459,64 @@ def main():
             stroke_width = st.slider("Stroke width:", 1, 150, 3, key="base_stroke_width")
             stroke_color = st.color_picker("Stroke color:", "#B5B5B5", key="base_stroke_color")
             
+            # If clone_mask is checked and ref_mask exists, use it as initial_drawing
+            initial_drawing = None
+            if clone_mask and ref_mask is not None and ref_mask.image_data is not None:
+                resized_mask = cv2.resize(ref_mask.image_data, (int(0.5*ref_image_pil.width), int(0.5*ref_image_pil.height)), interpolation=cv2.INTER_NEAREST)
+                initial_drawing = {
+                    "version": "4.4.0",
+                    "objects": [
+                        {
+                            "type": "image",
+                            "version": "4.4.0",
+                            "originX": "left",
+                            "originY": "top",
+                            "left": 0,
+                            "top": 0,
+                            "width": base_image_pil.width,
+                            "height": base_image_pil.height,
+                            "fill": "rgb(0,0,0)",
+                            "stroke": None,
+                            "strokeWidth": 0,
+                            "strokeDashArray": None,
+                            "strokeLineCap": "butt",
+                            "strokeDashOffset": 0,
+                            "strokeLineJoin": "miter",
+                            "strokeUniform": False,
+                            "strokeMiterLimit": 4,
+                            "scaleX": 1,
+                            "scaleY": 1,
+                            "angle": 0,
+                            "flipX": False,
+                            "flipY": False,
+                            "opacity": 1,
+                            "shadow": None,
+                            "visible": True,
+                            "backgroundColor": "",
+                            "fillRule": "nonzero",
+                            "paintFirst": "fill",
+                            "globalCompositeOperation": "source-over",
+                            "skewX": 0,
+                            "skewY": 0,
+                            "cropX": 0,
+                            "cropY": 0,
+                            "src": f"data:image/png;base64,{base64.b64encode(cv2.imencode('.png', resized_mask)[1]).decode()}",
+                            "crossOrigin": None,
+                            "filters": []
+                        }
+                    ]
+                }
+            
             base_mask = st_canvas(
                 fill_color="rgba(181, 181, 181, 0.8)",
                 stroke_width=stroke_width,
-                stroke_color=f"{stroke_color}80",  # 50 is the alpha value for translucency
+                stroke_color=f"{stroke_color}80",
                 background_image=base_image_pil,
                 height=base_image_pil.height,
                 width=base_image_pil.width,
                 drawing_mode=drawing_mode,
-                key="base_canvas"
+                key="base_canvas",
+                initial_drawing=initial_drawing
             )
 
 
